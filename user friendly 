@@ -1,0 +1,141 @@
+import streamlit as st
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import fitz
+import requests
+import os
+import pickle
+
+# Set tab title and emoji
+st.set_page_config(page_title="AgriBot 🌾", page_icon="🌾")
+
+# API Setup
+groq_api_key = ""  # Your API Key
+groq_api_url = "https://api.groq.com/openai/v1/chat/completions"
+default_model = "llama-3-70b-8192"
+pdf_folder = r"C:\Users\somya.misra\Downloads\KnowledgeBase for agriculture"
+
+# Sidebar UI
+st.sidebar.title("AgriBot Settings")
+temperature = st.sidebar.slider("Response Temperature", 0.0, 1.0, 0.7, 0.1)
+model_name = st.sidebar.selectbox("Select LLaMA Model", ["llama-3-8b-8192", "llama-3-70b-8192", "llama-3-8b-instruct"], index=1)
+build_button = st.sidebar.button("📚 Build Knowledge Base")
+
+@st.cache_resource
+def load_embed_model():
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+embed_model = load_embed_model()
+
+# PDF + Chunking + FAISS Functions
+def extract_text_from_pdf(pdf_data):
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    return "\n".join([page.get_text() for page in doc])
+
+def chunk_text(text, max_len=500):
+    sentences = text.split('. ')
+    chunks, current = [], ""
+    for s in sentences:
+        if len(current) + len(s) < max_len:
+            current += s + '. '
+        else:
+            chunks.append(current.strip())
+            current = s + '. '
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+def build_faiss_index(chunks, embed_model):
+    vectors = embed_model.encode(chunks)
+    dim = vectors.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(vectors).astype('float32'))
+    return index
+
+def save_knowledge(index, chunks, folder_path="knowledge_base"):
+    os.makedirs(folder_path, exist_ok=True)
+    faiss.write_index(index, os.path.join(folder_path, "faiss_index.idx"))
+    with open(os.path.join(folder_path, "chunks.pkl"), "wb") as f:
+        pickle.dump(chunks, f)
+
+def load_knowledge(folder_path="knowledge_base"):
+    index = faiss.read_index(os.path.join(folder_path, "faiss_index.idx"))
+    with open(os.path.join(folder_path, "chunks.pkl"), "rb") as f:
+        chunks = pickle.load(f)
+    return index, chunks
+
+def retrieve_context(query, index, chunks, top_k=5):
+    q_vec = embed_model.encode([query])
+    D, I = index.search(np.array(q_vec).astype('float32'), top_k)
+    return [chunks[i] for i in I[0]]
+
+def ask_groq(question, context, history):
+    conversation = [{"role": "user", "content": q} if i % 2 == 0 else {"role": "assistant", "content": a} for i, (q, a) in enumerate(history)]
+    prompt = f"Use the context below to answer the question.\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    conversation.append({"role": "user", "content": prompt})
+
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "model": model_name,
+        "messages": conversation,
+        "temperature": temperature,
+        "max_tokens": 500
+    }
+
+    response = requests.post(groq_api_url, headers=headers, json=data)
+    return response.json()['choices'][0]['message']['content'].strip() if response.status_code == 200 else "Sorry, I am unable to answer at the moment."
+
+# Session State Init
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "knowledge_index" not in st.session_state:
+    try:
+        index, chunks = load_knowledge()
+        st.session_state.knowledge_index = index
+        st.session_state.knowledge_chunks = chunks
+        st.sidebar.success("Knowledge base loaded.")
+    except:
+        st.sidebar.warning("Build the knowledge base first.")
+
+# Build Knowledge Base
+if build_button:
+    with st.spinner("Reading PDFs and building knowledge base..."):
+        all_text = ""
+        pdf_files = [f for f in os.listdir(pdf_folder) if f.endswith(".pdf")]
+        for filename in pdf_files:
+            with open(os.path.join(pdf_folder, filename), "rb") as f:
+                all_text += extract_text_from_pdf(f.read()) + "\n"
+        chunks = chunk_text(all_text)
+        index = build_faiss_index(chunks, embed_model)
+        save_knowledge(index, chunks)
+        st.session_state.knowledge_index = index
+        st.session_state.knowledge_chunks = chunks
+        st.sidebar.success(f"Knowledge base created from {len(pdf_files)} PDF(s).")
+
+# Main App UI
+st.title("🌾 AGRIBOT: Ask Me Anything About Agriculture")
+
+# Show chat history
+if st.session_state.chat_history:
+    st.subheader("Conversation History")
+    for q, a in st.session_state.chat_history:
+        st.markdown(f"**You:** {q}")
+        st.markdown(f"**Bot:** {a}")
+
+# Ask a question
+st.subheader("Ask a Question")
+col1, col2 = st.columns([8, 1])
+with col1:
+    question = st.text_input("Enter your question:", key="user_input", label_visibility="collapsed")
+with col2:
+    if st.button("➡️", key="ask_button") and question and st.session_state.knowledge_index is not None:
+        context_chunks = retrieve_context(question, st.session_state.knowledge_index, st.session_state.knowledge_chunks)
+        context = "\n".join(context_chunks)
+        answer = ask_groq(question, context, st.session_state.chat_history)
+        st.session_state.chat_history.append((question, answer))
+        st.experimental_rerun()
