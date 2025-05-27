@@ -1,0 +1,143 @@
+import streamlit as st
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import fitz  # PyMuPDF
+import requests
+import os
+import pickle
+
+# ---------------------- Configuration ---------------------- #
+groq_api_key = "YOUR_GROQ_API_KEY"  # Replace with your actual key
+groq_api_url = "https://api.groq.com/openai/v1/chat/completions"
+model_name = "mixtral-8x7b-32768"
+
+# ---------------------- Load Model ---------------------- #
+@st.cache_resource
+def load_embed_model():
+    return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+
+embed_model = load_embed_model()
+
+# ---------------------- Text Extraction ---------------------- #
+def extract_text_from_pdf(pdf_data):
+    doc = fitz.open(stream=pdf_data, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
+# ---------------------- Chunking ---------------------- #
+def chunk_text(text, max_len=500):
+    sentences = text.split('. ')
+    chunks = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) < max_len:
+            current += s + '. '
+        else:
+            chunks.append(current.strip())
+            current = s + '. '
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+# ---------------------- FAISS Index ---------------------- #
+def build_faiss_index(chunks, embed_model):
+    vectors = embed_model.encode(chunks)
+    dim = vectors.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.array(vectors).astype('float32'))
+    return index
+
+# ---------------------- Save/Load ---------------------- #
+def save_knowledge(index, chunks, folder_path="knowledge_base"):
+    os.makedirs(folder_path, exist_ok=True)
+    faiss.write_index(index, os.path.join(folder_path, "faiss_index.idx"))
+    with open(os.path.join(folder_path, "chunks.pkl"), "wb") as f:
+        pickle.dump(chunks, f)
+
+def load_knowledge(folder_path="knowledge_base"):
+    index = faiss.read_index(os.path.join(folder_path, "faiss_index.idx"))
+    with open(os.path.join(folder_path, "chunks.pkl"), "rb") as f:
+        chunks = pickle.load(f)
+    return index, chunks
+
+# ---------------------- Context Retrieval ---------------------- #
+def retrieve_context(query, index, chunks, top_k=5):
+    q_vec = embed_model.encode([query])
+    D, I = index.search(np.array(q_vec).astype('float32'), top_k)
+    return [chunks[i] for i in I[0]]
+
+# ---------------------- Chat Completion ---------------------- #
+def ask_groq(question, context, history):
+    conversation = []
+    for q, a in history:
+        conversation.append({"role": "user", "content": q})
+        conversation.append({"role": "assistant", "content": a})
+    prompt = f"Use the context below to answer the question.\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+    conversation.append({"role": "user", "content": prompt})
+
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "model": model_name,
+        "messages": conversation,
+        "temperature": 0.7,
+        "max_tokens": 500
+    }
+
+    response = requests.post(groq_api_url, headers=headers, json=data)
+    if response.status_code == 200:
+        return response.json()['choices'][0]['message']['content'].strip()
+    else:
+        return "Sorry, I am unable to answer at the moment."
+
+# ---------------------- Streamlit UI ---------------------- #
+st.title("Conversational Chatbot with PDF Knowledge")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "knowledge_index" not in st.session_state:
+    st.session_state.knowledge_index = None
+    st.session_state.knowledge_chunks = None
+
+uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+if uploaded_file and st.button("Build Knowledge Base"):
+    with st.spinner("Extracting text and building knowledge base..."):
+        text = extract_text_from_pdf(uploaded_file.read())
+        chunks = chunk_text(text)
+        index = build_faiss_index(chunks, embed_model)
+        save_knowledge(index, chunks)
+        st.session_state.knowledge_index = index
+        st.session_state.knowledge_chunks = chunks
+        st.success("Knowledge base created!")
+
+# Optionally load saved knowledge base
+if st.session_state.knowledge_index is None:
+    try:
+        index, chunks = load_knowledge()
+        st.session_state.knowledge_index = index
+        st.session_state.knowledge_chunks = chunks
+        st.info("Loaded existing knowledge base.")
+    except:
+        st.warning("Upload a PDF to build knowledge base.")
+
+question = st.text_input("Ask a question from the PDF knowledge:")
+if question and st.session_state.knowledge_index is not None:
+    context_chunks = retrieve_context(question, st.session_state.knowledge_index, st.session_state.knowledge_chunks)
+    context = "\n".join(context_chunks)
+    answer = ask_groq(question, context, st.session_state.chat_history)
+    st.session_state.chat_history.append((question, answer))
+    st.markdown(f"**Answer:** {answer}")
+
+# Display chat history
+if st.session_state.chat_history:
+    st.subheader("Conversation History")
+    for q, a in st.session_state.chat_history:
+        st.markdown(f"**You:** {q}")
+        st.markdown(f"**Bot:** {a}")
