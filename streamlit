@@ -1,0 +1,26 @@
+import streamlit as st
+from utils.rag_pipeline import load_documents_from_folder, build_vector_store
+from langchain.chains import RetrievalQA
+from langchain.llms import Groq
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+api_key = os.getenv("GROQ_API_KEY")
+
+st.title("AgriBot: Your Agriculture Advisor")
+folder_path = "data/"
+
+if "qa_chain" not in st.session_state:
+    with st.spinner("Indexing PDFs..."):
+        docs = load_documents_from_folder(folder_path)
+        vectordb = build_vector_store(docs)
+
+        llm = Groq(temperature=0, model_name="llama3-8b-8192", api_key=api_key)
+        qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=vectordb.as_retriever())
+        st.session_state.qa_chain = qa_chain
+
+query = st.text_input("Ask a question about agriculture:")
+if query:
+    result = st.session_state.qa_chain.run(query)
+    st.write(result)
